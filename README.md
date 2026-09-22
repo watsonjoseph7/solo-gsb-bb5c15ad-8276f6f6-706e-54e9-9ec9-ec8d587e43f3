@@ -74,6 +74,39 @@ docker compose up --build
   提高 `max_disabled` 后可能变为可行；可行解的停用数只取决于数据，不会因放宽上限而多停载频。
 - 分析不存在 → `404`；无违规产物 → 任意上限都返回 `feasible=true` 与空集合。
 
+## 新增载频禁用区间（carrier exclusion ranges）
+
+`GET /sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b`
+直接基于站点配置计算，**不执行也不保存分析**。查询参数为**正整数**且
+`candidate_start_hz ≤ candidate_end_hz`（缺失、非正、非整数或起点大于终点 → `422`；
+站点不存在 → `404`）。
+
+- **禁用判定**：在整数位置 `x` 新增载频，会与每个现有载频 `c` 产生两类新三阶产物
+  `2·x − c` 与 `2·c − x`。任一产物落在扫描范围 `[scan_start_hz, scan_end_hz]` 内，
+  且到任一**现有**载频或保护频段的距离**严格小于** `guard_interval_hz` 时
+  （与分析语义一致），`x` 即不宜新增；**现有载频点本身也视为禁用**。
+- **整数 Hz 反解**：违规产物位置是开区间 `(ref − g, ref + g)`（`ref` 为载频或保护频段
+  边界，`g` 为保护间隔），整数点端点各内缩 1 Hz；对 `2·x − c` 反解时除以 2
+  起点向上取整、终点向下取整，对 `2·c − x` 取镜像区间。`g = 0` 时无违规产物位置，
+  仅载频点禁用。
+- **最小并集**：全部禁用位置裁剪到候选闭区间后，合并重叠或相邻（整数 Hz 下起点
+  相差 ≤ 1）的区间，按起点升序返回 `exclusion_ranges`；无禁用位置时返回空列表。
+
+响应示例（载频 `[1000]`、保护频段 `[480, 520]`、`guard_interval_hz=150`，候选范围 `[1, 10000]`）：
+
+```json
+{
+  "site_id": 1,
+  "candidate_start_hz": 1,
+  "candidate_end_hz": 10000,
+  "exclusion_ranges": [
+    {"start_hz": 666, "end_hz": 834},
+    {"start_hz": 851, "end_hz": 1149},
+    {"start_hz": 1331, "end_hz": 1669}
+  ]
+}
+```
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -91,6 +124,7 @@ docker compose up --build
 | `POST` | `/sites` | 创建站点（频率方案），`201` |
 | `GET` | `/sites` | 列出全部已保存方案 |
 | `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
+| `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 候选闭区间内不宜新增载频的最小区间并集（不执行或保存分析） |
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201` |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
@@ -125,6 +159,9 @@ curl http://localhost:8000/analyses/1/risk-groups
 
 # 求最小停用方案（最多停用 2 个载频；仅使用已保存的分析结果）
 curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
+
+# 查询候选范围 [1, 10000] 内不宜新增载频的区间（不执行或保存分析）
+curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=10000'
 ```
 
 分析响应节选：
@@ -193,7 +230,7 @@ curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（27 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案）
+# 运行测试（36 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -211,7 +248,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解
   database.py   # SQLite 建表与读写（单事务批量写入）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

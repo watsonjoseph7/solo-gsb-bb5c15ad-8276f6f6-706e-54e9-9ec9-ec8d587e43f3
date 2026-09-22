@@ -133,3 +133,21 @@ class MitigationPlan(BaseModel):
     remaining_product_freqs_hz: list[int] = Field(
         ..., description="该方案下仍未消除的违规产物频率（升序）；feasible=true 时恒为空列表"
     )
+
+
+class ExclusionRange(BaseModel):
+    """一段不宜新增载频的闭区间 [start_hz, end_hz]（整数 Hz）。"""
+
+    start_hz: int = Field(..., description="区间起点（含），整数 Hz")
+    end_hz: int = Field(..., description="区间终点（含），整数 Hz")
+
+
+class CarrierExclusionResult(BaseModel):
+    """候选范围内不宜新增载频区间的最小并集（不执行也不保存分析）。"""
+
+    site_id: int
+    candidate_start_hz: int = Field(..., description="候选范围起点（含），整数 Hz")
+    candidate_end_hz: int = Field(..., description="候选范围终点（含），整数 Hz")
+    exclusion_ranges: list[ExclusionRange] = Field(
+        ..., description="不宜新增载频的闭区间，按起点升序，互不重叠且互不相邻"
+    )

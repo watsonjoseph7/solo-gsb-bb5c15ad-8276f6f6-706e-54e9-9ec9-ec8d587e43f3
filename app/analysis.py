@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .schemas import (
+    ExclusionRange,
     GuardBand,
     HitObject,
     MitigationPlan,
@@ -614,3 +615,69 @@ def build_mitigation_plan(
             p.freq_hz for p in violating if p.freq_hz not in eliminated
         ],
     )
+
+
+def carrier_exclusion_ranges(
+    carriers_hz: list[int],
+    scan_start_hz: int,
+    scan_end_hz: int,
+    guard_bands: list[GuardBand],
+    guard_interval_hz: int,
+    candidate_start_hz: int,
+    candidate_end_hz: int,
+) -> list[ExclusionRange]:
+    """反解候选范围内不宜新增载频的最小区间并集（不执行也不保存分析）。
+
+    在 x 处新增载频会与每个现有载频 c 产生两类新三阶产物：2*x - c 与
+    2*c - x。产物违规当且仅当它落在扫描范围 [scan_start_hz, scan_end_hz]
+    内，且到任一现有载频或保护频段的距离严格小于 guard_interval_hz
+    （与分析语义一致）。先把违规产物位置折算为整数 Hz 闭区间：开区间
+    (ref - g, ref + g) 的整数点为 [ref - g + 1, ref + g - 1]；再按两种
+    公式分别反解 x 的整数区间——公式一除以 2 时起点向上取整、终点向下
+    取整，公式二为镜像区间无需取整。现有载频点同样禁用。结果裁剪到
+    [candidate_start_hz, candidate_end_hz]，合并重叠或相邻（整数 Hz 下
+    下一区间起点 <= 当前终点 + 1）的区间，按起点升序返回。
+    """
+    g = guard_interval_hz
+    # 违规产物位置（整数 Hz 闭区间）：到载频 f 距离 < g 即开区间 (f-g, f+g)，
+    # 到保护频段 [s, e] 距离 < g 即开区间 (s-g, e+g)。g = 0 时距离 < 0 恒不
+    # 成立（保护频段内部距离为 0 也不违规），无违规产物位置。
+    zones: list[tuple[int, int]] = []
+    if g > 0:
+        raw = [(f - g + 1, f + g - 1) for f in carriers_hz]
+        raw += [(b.start_hz - g + 1, b.end_hz + g - 1) for b in guard_bands]
+        for lo, hi in raw:
+            lo, hi = max(lo, scan_start_hz), min(hi, scan_end_hz)
+            if lo <= hi:
+                zones.append((lo, hi))
+
+    intervals: list[tuple[int, int]] = []
+    for c in carriers_hz:
+        for p_lo, p_hi in zones:
+            # 公式一：p = 2*x - c ∈ [p_lo, p_hi]
+            #   -> x ∈ [ceil((p_lo + c) / 2), floor((p_hi + c) / 2)]
+            lo = -(-(p_lo + c) // 2)
+            hi = (p_hi + c) // 2
+            if lo <= hi:
+                intervals.append((lo, hi))
+            # 公式二：p = 2*c - x ∈ [p_lo, p_hi] -> x ∈ [2*c - p_hi, 2*c - p_lo]
+            lo, hi = 2 * c - p_hi, 2 * c - p_lo
+            if lo <= hi:
+                intervals.append((lo, hi))
+    # 现有载频点也视为禁用
+    intervals.extend((f, f) for f in carriers_hz)
+
+    # 裁剪到候选范围，合并重叠或相邻区间（结果已按起点升序）
+    clipped: list[tuple[int, int]] = []
+    for lo, hi in intervals:
+        lo, hi = max(lo, candidate_start_hz), min(hi, candidate_end_hz)
+        if lo <= hi:
+            clipped.append((lo, hi))
+    clipped.sort()
+    merged: list[ExclusionRange] = []
+    for lo, hi in clipped:
+        if merged and lo <= merged[-1].end_hz + 1:
+            merged[-1].end_hz = max(merged[-1].end_hz, hi)
+        else:
+            merged.append(ExclusionRange(start_hz=lo, end_hz=hi))
+    return merged

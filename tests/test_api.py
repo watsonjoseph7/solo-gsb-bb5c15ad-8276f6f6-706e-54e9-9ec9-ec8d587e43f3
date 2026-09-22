@@ -257,7 +257,153 @@ def test_risk_groups_use_persisted_result(client):
     assert [g["group_id"] for g in first] == list(range(1, len(first) + 1))
 
 
-# ---------------------------------------------------------------- 停用方案（mitigation plan）
+# ---------------------------------------------------------------- 新增载频禁用区间
+
+def test_carrier_exclusion_ranges_both_formulas_and_merge(client):
+    # 载频 [1000, 5000]，g=10：违规产物位置为 (990,1010) 与 (4990,5010) 的整数点。
+    # 公式一 2*x-c：x∈[996,1004]（c=1000，ceil(1991/2)/floor(2009/2) 检验除 2 取整）、
+    # [2996,3004]（两个载频各贡献一次）、[4996,5004]（c=5000）；
+    # 公式二 2*c-x：x∈[991,1009]、[4991,5009]、[8991,9009]（负区间被候选范围裁掉）；
+    # 载频点 [1000,1000]、[5000,5000] 被相邻区间吸收合并。
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 5000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 100000},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "candidate_start_hz": 1,
+        "candidate_end_hz": 100000,
+        "exclusion_ranges": [
+            {"start_hz": 991, "end_hz": 1009},
+            {"start_hz": 2996, "end_hz": 3004},
+            {"start_hz": 4991, "end_hz": 5009},
+            {"start_hz": 8991, "end_hz": 9009},
+        ],
+    }
+
+
+def test_carrier_exclusion_ranges_open_boundary(client):
+    # 开边界：产物到载频的距离恰好等于 g 时不违规。单载频 1000、g=10 时
+    # 禁用区间为 [991,1009]；若误用闭边界会得到 [990,1010]
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    body = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 100000},
+    ).json()
+    assert body["exclusion_ranges"] == [{"start_hz": 991, "end_hz": 1009}]
+
+
+def test_carrier_exclusion_ranges_with_guard_band(client):
+    # 保护频段 [480,520]、g=150 产生违规产物位置 [331,669]，载频 1000 产生
+    # [851,1149]；反解后载频点 [1000,1000] 被 [851,1149] 吸收
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000],
+        guard_bands=[{"start_hz": 480, "end_hz": 520}],
+        guard_interval_hz=150,
+    ))
+    body = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 10000},
+    ).json()
+    assert body["exclusion_ranges"] == [
+        {"start_hz": 666, "end_hz": 834},
+        {"start_hz": 851, "end_hz": 1149},
+        {"start_hz": 1331, "end_hz": 1669},
+    ]
+
+
+def test_carrier_exclusion_ranges_clipped_to_candidate(client):
+    # 与上一组相同的数据，候选范围 [1005, 4990]：首区间被裁剪，
+    # [4991,5009] 与 [8991,9009] 整体落在候选范围外被丢弃
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000, 5000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    body = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1005, "candidate_end_hz": 4990},
+    ).json()
+    assert body["exclusion_ranges"] == [
+        {"start_hz": 1005, "end_hz": 1009},
+        {"start_hz": 2996, "end_hz": 3004},
+    ]
+
+
+def test_carrier_exclusion_ranges_zero_guard_interval(client):
+    # g=0：任何产物都不违规，仅现有载频点禁用；相邻载频点 [100,100] 与
+    # [101,101] 合并为 [100,101]
+    client.post("/sites", json=make_payload(
+        carriers_hz=[100, 101, 105], guard_interval_hz=0,
+    ))
+    body = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 1000},
+    ).json()
+    assert body["exclusion_ranges"] == [
+        {"start_hz": 100, "end_hz": 101},
+        {"start_hz": 105, "end_hz": 105},
+    ]
+
+
+def test_carrier_exclusion_ranges_empty_when_nothing_forbidden(client):
+    # 候选范围避开全部禁用位置时返回空列表
+    client.post("/sites", json=make_payload(
+        carriers_hz=[1000], scan_end_hz=100000, guard_interval_hz=10,
+    ))
+    body = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 2000, "candidate_end_hz": 3000},
+    ).json()
+    assert body["exclusion_ranges"] == []
+
+
+def test_carrier_exclusion_ranges_404(client):
+    resp = client.get(
+        "/sites/999/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 100},
+    )
+    assert resp.status_code == 404
+
+
+def test_carrier_exclusion_ranges_param_validation(client):
+    client.post("/sites", json=make_payload())
+    base = "/sites/1/carrier-exclusion-ranges"
+    # 缺参 / 非正整数 / 非整数 -> 422
+    assert client.get(base).status_code == 422
+    assert client.get(base, params={"candidate_start_hz": 1}).status_code == 422
+    for bad in (
+        {"candidate_start_hz": 0, "candidate_end_hz": 100},
+        {"candidate_start_hz": 1, "candidate_end_hz": -5},
+        {"candidate_start_hz": "abc", "candidate_end_hz": 100},
+        {"candidate_start_hz": 1.5, "candidate_end_hz": 100},
+        {"candidate_start_hz": 200, "candidate_end_hz": 100},  # 起点大于终点
+    ):
+        resp = client.get(base, params=bad)
+        assert resp.status_code == 422, bad
+    # 起点等于终点合法（闭区间退化为单点候选范围）
+    ok = client.get(base, params={"candidate_start_hz": 300, "candidate_end_hz": 300})
+    assert ok.status_code == 200
+    assert ok.json()["exclusion_ranges"] == [{"start_hz": 300, "end_hz": 300}]
+
+
+def test_carrier_exclusion_ranges_does_not_save_analysis(client):
+    # 该端点不执行也不保存分析：调用后仍无分析记录
+    client.post("/sites", json=make_payload())
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 10000},
+    )
+    assert resp.status_code == 200
+    assert client.get("/sites/1/analysis").status_code == 404
+    assert client.get("/sites/1/analyses").json() == []
+
+
+
 
 def _create_and_analyze(client, **payload_overrides):
     client.post("/sites", json=make_payload(**payload_overrides))
