@@ -440,3 +440,186 @@ def test_mitigation_plan_uses_persisted_result(client):
 
 def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------- 新增载频禁用区间（不执行/保存分析）
+
+def test_carrier_exclusion_ranges_basic(client):
+    # 载频 [100,300,400]、guard=150、扫描 [1,10000]、候选 [1,1000]：
+    # 闭区间右端点 799 禁用（2*400-799=1 落在扫描范围，距载频 100 为 99 < 150）；
+    # 800 允许（2*400-800=0 已在扫描起点 1 之外，其余范围内产物距离均 >= 150）
+    client.post("/sites", json=make_payload())
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 1000},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "candidate_start_hz": 1,
+        "candidate_end_hz": 1000,
+        "guard_interval_hz": 150,
+        "ranges": [{"start_hz": 1, "end_hz": 799}],
+    }
+    # 只读：未产生任何分析记录
+    assert client.get("/sites/1/analyses").json() == []
+
+
+def test_carrier_exclusion_ranges_strict_boundary_points(client):
+    client.post("/sites", json=make_payload())
+    # x=799 禁用，x=800/801 允许（距离等于 guard_interval 不算违规，且 0 超出扫描范围）
+    assert client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 799, "candidate_end_hz": 799},
+    ).json()["ranges"] == [{"start_hz": 799, "end_hz": 799}]
+    assert client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 800, "candidate_end_hz": 800},
+    ).json()["ranges"] == []
+
+
+def test_carrier_exclusion_ranges_guard_band(client):
+    # 保护频段 [880,920]、guard=50：新 x 产生的产物落入 831..969 即禁用；
+    # 反解两种公式并与现有载频 1000/1100 的保护邻域合并
+    client.post(
+        "/sites",
+        json=make_payload(
+            carriers_hz=[1000, 1100],
+            guard_bands=[{"start_hz": 880, "end_hz": 920}],
+            guard_interval_hz=50,
+        ),
+    )
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 2000},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ranges"] == [{"start_hz": 851, "end_hz": 1369}]
+
+
+def test_carrier_exclusion_ranges_division_rounding_even_carrier(client):
+    # 单载频 c=100、guard=3：禁用产物 p 为 98..102。
+    # 公式 2*x-100=p 要求 p 偶（98/100/102）-> x=99/100/101（开边界 97、103 不取）；
+    # 公式 200-x=p 无奇偶限制 -> x=98..102；并集为 [98,102]
+    client.post(
+        "/sites",
+        json=make_payload(carriers_hz=[100], guard_interval_hz=3),
+    )
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 90, "candidate_end_hz": 115},
+    )
+    assert resp.json()["ranges"] == [{"start_hz": 98, "end_hz": 102}]
+
+
+def test_carrier_exclusion_ranges_division_rounding_odd_carrier(client):
+    # 奇数载频 c=101、guard=3：公式 2*x-101=p 要求 p 奇（99/101/103）->
+    # x=100/101/102；公式 202-x=p -> x=99..103；并集为 [99,103]
+    client.post(
+        "/sites",
+        json=make_payload(carriers_hz=[101], guard_interval_hz=3),
+    )
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 90, "candidate_end_hz": 115},
+    )
+    assert resp.json()["ranges"] == [{"start_hz": 99, "end_hz": 103}]
+
+
+def test_carrier_exclusion_ranges_existing_carriers_always_forbidden(client):
+    # guard_interval=0：任何距离都不满足严格小于 0，产物不产生禁用点；
+    # 但现有载频点本身恒为禁用（三个孤立单点，不相邻则不合并）
+    client.post("/sites", json=make_payload(guard_interval_hz=0))
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 1000},
+    )
+    assert resp.json()["ranges"] == [
+        {"start_hz": 100, "end_hz": 100},
+        {"start_hz": 300, "end_hz": 300},
+        {"start_hz": 400, "end_hz": 400},
+    ]
+
+
+def test_carrier_exclusion_ranges_adjacent_points_merge(client):
+    # guard=0 且现有载频 100、101 相邻：两个禁用单点合并为一个闭区间
+    client.post(
+        "/sites",
+        json=make_payload(carriers_hz=[100, 101], guard_interval_hz=0),
+    )
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 200},
+    )
+    assert resp.json()["ranges"] == [{"start_hz": 100, "end_hz": 101}]
+
+
+def test_carrier_exclusion_ranges_clipped_and_scan_limited(client):
+    # 扫描范围 [150,350]、guard=100：产物落在扫描范围外（如 0、50、149）不判定；
+    # 候选 [1,600] 内禁用段在两侧被裁剪，扫描范围外的候选仍可允许
+    client.post(
+        "/sites",
+        json=make_payload(
+            carriers_hz=[100, 300],
+            scan_start_hz=150,
+            scan_end_hz=350,
+            guard_interval_hz=100,
+        ),
+    )
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 600},
+    )
+    assert resp.json()["ranges"] == [
+        {"start_hz": 1, "end_hz": 50},
+        {"start_hz": 100, "end_hz": 100},
+        {"start_hz": 125, "end_hz": 149},
+        {"start_hz": 151, "end_hz": 399},
+        {"start_hz": 401, "end_hz": 450},
+    ]
+
+
+def test_carrier_exclusion_ranges_clipped_to_candidate(client):
+    # 同一站点、候选 [150,350]：结果裁剪到候选范围后合并为单段
+    client.post("/sites", json=make_payload())
+    resp = client.get(
+        "/sites/1/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 150, "candidate_end_hz": 350},
+    )
+    assert resp.json()["ranges"] == [{"start_hz": 150, "end_hz": 350}]
+
+
+def test_carrier_exclusion_ranges_404(client):
+    assert client.get(
+        "/sites/999/carrier-exclusion-ranges",
+        params={"candidate_start_hz": 1, "candidate_end_hz": 10},
+    ).status_code == 404
+
+
+def test_carrier_exclusion_ranges_validation(client):
+    client.post("/sites", json=make_payload())
+    base = "/sites/1/carrier-exclusion-ranges"
+    # 缺少必填参数 -> 422
+    assert client.get(base).status_code == 422
+    assert client.get(base, params={"candidate_start_hz": 1}).status_code == 422
+    # 非正整数 -> 422
+    for bad_start, bad_end in ((0, 10), (-1, 10), (1, 0), (1, -5)):
+        assert client.get(
+            base,
+            params={"candidate_start_hz": bad_start, "candidate_end_hz": bad_end},
+        ).status_code == 422
+    # 非整数 -> 422
+    assert client.get(
+        base, params={"candidate_start_hz": "x", "candidate_end_hz": 10}
+    ).status_code == 422
+    # 起点大于终点 -> 422
+    resp = client.get(
+        base, params={"candidate_start_hz": 100, "candidate_end_hz": 99}
+    )
+    assert resp.status_code == 422
+    # 起点等于终点合法（单点候选）
+    ok = client.get(
+        base, params={"candidate_start_hz": 100, "candidate_end_hz": 100}
+    )
+    assert ok.status_code == 200
+    assert ok.json()["ranges"] == [{"start_hz": 100, "end_hz": 100}]

@@ -110,6 +110,25 @@ class RiskGroup(BaseModel):
     distance_hz: int = Field(..., description="组内产物到命中对象的最小距离")
 
 
+class FrequencyRange(BaseModel):
+    """整数 Hz 的闭区间 [start_hz, end_hz]。"""
+
+    start_hz: int = Field(..., description="区间起点（含），整数 Hz")
+    end_hz: int = Field(..., description="区间终点（含），整数 Hz")
+
+
+class CarrierExclusionRanges(BaseModel):
+    """候选范围内不宜新增载频的最小并集（不执行或保存任何分析）。"""
+
+    site_id: int
+    candidate_start_hz: int = Field(..., description="候选范围起点（含）")
+    candidate_end_hz: int = Field(..., description="候选范围终点（含）")
+    guard_interval_hz: int = Field(..., description="判定使用的保护间隔：距离严格小于该值即禁用")
+    ranges: list[FrequencyRange] = Field(
+        ..., description="禁用区间的最小并集（重叠或相邻已合并），按起点升序；无禁用点时为空列表"
+    )
+
+
 class MitigationPlan(BaseModel):
     """违规产物停用方案：在停用载频数上限内精确求解最小停用集合（最小点覆盖）。
 

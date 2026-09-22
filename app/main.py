@@ -7,10 +7,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, status
 
 from . import database
-from .analysis import analyze, build_mitigation_plan, build_risk_groups
+from .analysis import (
+    analyze,
+    build_mitigation_plan,
+    build_risk_groups,
+    compute_exclusion_ranges,
+)
 from .schemas import (
     AnalysisMeta,
     AnalysisResult,
+    CarrierExclusionRanges,
+    FrequencyRange,
     MitigationPlan,
     RiskGroup,
     SiteCreate,
@@ -68,6 +75,56 @@ def get_site(site_id: int) -> SiteOut:
     if site is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
     return site
+
+
+@app.get(
+    "/sites/{site_id}/carrier-exclusion-ranges",
+    response_model=CarrierExclusionRanges,
+    tags=["sites"],
+    summary="求候选闭区间内不宜新增载频的最小并集（不落库、不执行分析）",
+    description=(
+        "接收正整数 candidate_start_hz、candidate_end_hz（前者不大于后者），"
+        "对每个现有载频 c 分别反解 2*x-c 与 2*c-x：产物须落在站点扫描范围内，"
+        "且到任一现有载频或保护频段的距离严格小于 guard_interval_hz。现有载频"
+        "点本身也视为禁用。结果裁剪到候选范围，合并重叠或相邻区间并按起点升序。"
+        "站点不存在返回 404，参数非法返回 422。"
+    ),
+)
+def get_carrier_exclusion_ranges(
+    site_id: int,
+    candidate_start_hz: int = Query(
+        ..., ge=1, description="候选范围起点（含），正整数 Hz"
+    ),
+    candidate_end_hz: int = Query(
+        ..., ge=1, description="候选范围终点（含），正整数 Hz，不得小于起点"
+    ),
+) -> CarrierExclusionRanges:
+    site = database.fetch_site(site_id)
+    if site is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    if candidate_start_hz > candidate_end_hz:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "candidate_end_hz must be greater than or equal to candidate_start_hz",
+        )
+    ranges = compute_exclusion_ranges(
+        carriers_hz=site.carriers_hz,
+        scan_start_hz=site.scan_start_hz,
+        scan_end_hz=site.scan_end_hz,
+        guard_bands=site.guard_bands,
+        guard_interval_hz=site.guard_interval_hz,
+        candidate_start_hz=candidate_start_hz,
+        candidate_end_hz=candidate_end_hz,
+    )
+    return CarrierExclusionRanges(
+        site_id=site_id,
+        candidate_start_hz=candidate_start_hz,
+        candidate_end_hz=candidate_end_hz,
+        guard_interval_hz=site.guard_interval_hz,
+        ranges=[
+            FrequencyRange(start_hz=lo, end_hz=hi) for lo, hi in ranges
+        ],
+    )
 
 
 @app.post(

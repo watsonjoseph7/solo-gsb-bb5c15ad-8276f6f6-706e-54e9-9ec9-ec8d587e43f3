@@ -10,6 +10,21 @@ from .schemas import (
     SourcePair,
 )
 
+Interval = tuple[int, int]
+
+
+def _merge_intervals(intervals: list[Interval]) -> list[Interval]:
+    """合并整数闭区间：丢弃空区间（lo > hi），重叠或相邻（lo <= prev_hi + 1）者合并，按起点升序。"""
+    valid = sorted((lo, hi) for lo, hi in intervals if lo <= hi)
+    merged: list[Interval] = []
+    for lo, hi in valid:
+        if merged and lo <= merged[-1][1] + 1:
+            prev_lo, prev_hi = merged[-1]
+            merged[-1] = (prev_lo, max(prev_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
 
 def enumerate_third_order_products(
     carriers_hz: list[int], scan_start_hz: int, scan_end_hz: int
@@ -614,3 +629,86 @@ def build_mitigation_plan(
             p.freq_hz for p in violating if p.freq_hz not in eliminated
         ],
     )
+
+
+def _forbidden_product_intervals(
+    carriers_hz: list[int],
+    guard_bands: list[GuardBand],
+    guard_interval_hz: int,
+    scan_start_hz: int,
+    scan_end_hz: int,
+) -> list[Interval]:
+    """构造产物频率空间 p 上的禁用区间（已裁剪到扫描范围并合并）。
+
+    落在任一现有载频或保护频段距离严格小于 guard_interval_hz 内（整数 Hz
+    即半径 guard_interval_hz-1）的产物频率均属禁用；guard_interval_hz=0
+    时产物空间没有禁用点（距离 0 不满足严格小于 0；候选载频点本身的禁用
+    在 compute_exclusion_ranges 中单独处理）。
+    """
+    radius = guard_interval_hz - 1
+    intervals: list[Interval] = []
+    if radius >= 0:
+        # 保护间隔 g>=1：半径 g-1 的闭邻域包含载频点本身（距离 0 严格小于 g）；
+        # g=0 时任何距离都不满足严格小于 0，产物空间无禁用点
+        for carrier in carriers_hz:
+            intervals.append((carrier - radius, carrier + radius))
+        for band in guard_bands:
+            # 频段 [a,b] 与半径 r 的并恰为闭区间 [a-r, b+r]（带内距离为 0）
+            intervals.append((band.start_hz - radius, band.end_hz + radius))
+    clipped = [
+        (max(lo, scan_start_hz), min(hi, scan_end_hz)) for lo, hi in intervals
+    ]
+    return _merge_intervals(clipped)
+
+
+def _even_half_range(lo: int, hi: int) -> Interval:
+    """区间内与 hi 同奇偶（即除以 2 为整数）的点映射到 x 后对 x 的整数范围。
+
+    用于反解 2*x - c = p（p 与 c 同奇偶）：在已裁剪奇偶的 p 上，
+    x = (p + c) / 2 的取值范围是 [ceil((lo+c)/2), floor((hi+c)/2)]。
+    调用方保证 [lo, hi] 内存在与 c 同奇偶的点，即结果非空。
+    """
+    return ((lo + 1) // 2, hi // 2)
+
+
+def compute_exclusion_ranges(
+    carriers_hz: list[int],
+    scan_start_hz: int,
+    scan_end_hz: int,
+    guard_bands: list[GuardBand],
+    guard_interval_hz: int,
+    candidate_start_hz: int,
+    candidate_end_hz: int,
+) -> list[Interval]:
+    """候选闭区间 [candidate_start_hz, candidate_end_hz] 内不宜新增载频的最小并集。
+
+    对每个现有载频 c 分别反解两种三阶产物公式（新载频 x 与 c 不同频，同频点
+    本身已显式禁用）：
+      - 2*x - c = p：p 须与 c 同奇偶，x = (p + c) / 2（除以 2 取整）；
+      - 2*c - x = p：x = 2*c - p（无奇偶限制）。
+    仅当产物 p 落在站点扫描范围且到任一现有载频或保护频段的距离严格小于
+    guard_interval_hz 时，对应 x 被禁用。现有载频点本身同样禁用。结果裁剪到
+    候选范围（候选频率为正整数），合并重叠或相邻区间后按起点升序返回。
+    """
+    forbidden_p = _forbidden_product_intervals(
+        carriers_hz, guard_bands, guard_interval_hz, scan_start_hz, scan_end_hz
+    )
+    ranges: list[Interval] = []
+    for c in carriers_hz:
+        # 现有载频点本身禁用（无论是否落在扫描范围内），裁剪到候选范围
+        ranges.append((max(c, candidate_start_hz), min(c, candidate_end_hz)))
+        for plo, phi in forbidden_p:
+            # 公式一 2*x - c = p：只保留与 c 同奇偶的 p
+            par_lo = plo if (plo - c) % 2 == 0 else plo + 1
+            par_hi = phi if (phi - c) % 2 == 0 else phi - 1
+            if par_lo <= par_hi:
+                xlo, xhi = _even_half_range(par_lo + c, par_hi + c)
+                ranges.append(
+                    (max(xlo, candidate_start_hz), min(xhi, candidate_end_hz))
+                )
+            # 公式二 2*c - x = p：x = 2*c - p，p 区间升序映射为 x 区间降序
+            xlo, xhi = 2 * c - phi, 2 * c - plo
+            ranges.append(
+                (max(xlo, candidate_start_hz), min(xhi, candidate_end_hz))
+            )
+    return _merge_intervals(ranges)

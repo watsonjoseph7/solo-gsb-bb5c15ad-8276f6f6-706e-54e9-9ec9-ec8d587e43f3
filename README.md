@@ -74,6 +74,27 @@ docker compose up --build
   提高 `max_disabled` 后可能变为可行；可行解的停用数只取决于数据，不会因放宽上限而多停载频。
 - 分析不存在 → `404`；无违规产物 → 任意上限都返回 `feasible=true` 与空集合。
 
+## 新增载频禁用区间（carrier exclusion ranges）
+
+`GET /sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b`
+在**不执行或保存任何分析**的情况下，返回候选闭区间 `[a, b]`（正整数 Hz，`a ≤ b`）内
+**不宜新增载频的最小并集**。站点不存在 → `404`；参数缺失、非正整数、非整数或 `a > b` → `422`。
+
+对每个现有载频 `c`，假设候选点新增载频 `x`，分别反解两种三阶互调产物：
+
+- `2·x − c = p`：要求 `p` 与 `c` 同奇偶（`x = (p + c) / 2` 必须为整数 Hz，按除以 2 正确取整）；
+- `2·c − x = p`：无奇偶限制，`x = 2·c − p`。
+
+判定规则（均按整数 Hz 处理）：
+
+- 产物 `p` 必须落在站点扫描范围 `[scan_start_hz, scan_end_hz]` 内，范围外的产物不参与判定；
+- `p` 到任一现有载频或保护频段的距离**严格小于** `guard_interval_hz` 时，对应 `x` 禁用
+  （整数 Hz 上等价于落在半径 `guard_interval_hz − 1` 的闭邻域，距离恰好等于间隔的边界点不禁用）；
+- 现有载频点本身一律视为禁用（无论保护间隔取值）；`guard_interval_hz=0` 时仅禁用现有载频点。
+
+结果裁剪到候选范围，**合并重叠或相邻（端点相差 1）的区间**，按起点升序返回 `ranges`；
+无禁用点时为 `[]`。该端点为只读计算，不会创建分析记录、不写入数据库。
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -91,6 +112,7 @@ docker compose up --build
 | `POST` | `/sites` | 创建站点（频率方案），`201` |
 | `GET` | `/sites` | 列出全部已保存方案 |
 | `GET` | `/sites/{site_id}` | 查询单个已保存方案 |
+| `GET` | `/sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b` | 求候选闭区间内不宜新增载频的最小并集（不执行或保存分析；参数为正整数，起点不得大于终点） |
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201` |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
@@ -119,6 +141,9 @@ curl -X POST http://localhost:8000/sites/1/analysis
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
 curl http://localhost:8000/sites/1/analysis
+
+# 查询候选范围内不宜新增载频的区间（不执行或保存分析）
+curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=1000'
 
 # 查询风险分组（违规产物与来源载频的连通分量）
 curl http://localhost:8000/analyses/1/risk-groups
@@ -193,7 +218,7 @@ curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（27 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案）
+# 运行测试（38 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、新增载频禁用区间）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -211,7 +236,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间（两种公式反解）
   database.py   # SQLite 建表与读写（单事务批量写入）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
